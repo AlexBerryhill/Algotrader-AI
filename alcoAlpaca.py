@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST, TimeFrame
 import pandas as pd
+from datetime import datetime, timedelta
 
 # === Setup ===
 load_dotenv()
@@ -22,27 +23,57 @@ FAST, SLOW = 50, 100
 BAR_LIMIT = 200
 POSITION_PERCENT = 0.33  # 33% of account equity
 
+def log_data(entries, filename="alco_log.parquet"):
+    '''
+    @brief Appends structured log entries to a Parquet file
+    @param entries List of dicts, one per ticker
+    @param filename Name of the parquet log file
+    '''
+    df = pd.DataFrame(entries)
+
+    if os.path.exists(filename):
+        old = pd.read_parquet(filename)
+        df = pd.concat([old, df], ignore_index=True)
+
+    df.to_parquet(filename, index=False)
+
+
 def fetch_daily_ma(symbol):
     '''
     @brief Fetch daily bars and compute moving averages
     @param symbol Stock ticker symbol
     @return dict with 'ma_fast' and 'ma_slow' or None if insufficient data
     '''
-    
-    bars = api.get_bars(symbol, TimeFrame.Day, limit=BAR_LIMIT, adjustment='raw').df
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=(SLOW * 2))  # Fetch more than needed
+
+    bars = api.get_bars(
+        symbol,
+        TimeFrame.Day,
+        start=start_date.strftime("%Y-%m-%d"),
+        end=end_date.strftime("%Y-%m-%d"),
+        adjustment='raw',
+        feed='iex'
+    ).df
 
     if isinstance(bars.index, pd.MultiIndex):
         df = bars.xs(symbol, level=1)
     else:
         df = bars
 
-    if df.empty or len(df) <  SLOW:
+    if df.empty or len(df) < SLOW:
         return None
 
-    close = df['close']
+    cols = {c.lower(): c for c in df.columns}
+    close_col = cols.get("close")
+    if not close_col:
+        raise KeyError(f"No close column in bars; got {list(df.columns)}")
+
+    close = df[close_col]
     ma_fast = close.rolling(FAST).mean().iat[-1]
     ma_slow = close.rolling(SLOW).mean().iat[-1]
     return {"ma_fast": ma_fast, "ma_slow": ma_slow}
+
 
 def get_current_position(symbol):
     '''
@@ -77,33 +108,81 @@ def run_daily_check():
     @brief Main function to run daily MA crossover check and place orders
     '''
     equity = get_equity()
+    log_entries = []
+    timestamp = datetime.now().isoformat()
+
     for sym in TICKERS:
-        mas = fetch_daily_ma(sym)
-        if mas is None:
-            print(f"{sym}: insufficient data. Skipping.")
-            continue
-
-        pos_qty = get_current_position(sym)
-        last_price = get_last_price(sym)
-        buy_qty = int((POSITION_PERCENT * equity) // last_price)
-
-        mf, ms = mas["ma_fast"], mas["ma_slow"]
         try:
+            mas = fetch_daily_ma(sym)
+            if mas is None:
+                log_entries.append({
+                    "timestamp": timestamp,
+                    "symbol": sym,
+                    "equity": equity,
+                    "message": "Insufficient data",
+                    "success": False
+                })
+                continue
+
+            pos_qty = get_current_position(sym)
+            last_price = get_last_price(sym)
+            buy_qty = int((POSITION_PERCENT * equity) // last_price)
+
+            mf, ms = mas["ma_fast"], mas["ma_slow"]
+            action, signal, success, message = None, None, False, ""
+
             if mf > ms and pos_qty == 0 and buy_qty > 0:
-                print(f"{sym}: MA{FAST}({mf:.2f}) > MA{SLOW}({ms:.2f}); BUY {buy_qty}")
+                signal = "BUY"
+                action = f"BUY {buy_qty}"
                 api.submit_order(symbol=sym, qty=buy_qty, side="buy",
                                  type="market", time_in_force="day")
+                success, message = True, "Order submitted"
 
             elif mf < ms and pos_qty > 0:
-                print(f"{sym}: MA{FAST}({mf:.2f}) < MA{SLOW}({ms:.2f}); SELL {pos_qty}")
+                signal = "SELL"
+                action = f"SELL {pos_qty}"
                 api.submit_order(symbol=sym, qty=pos_qty, side="sell",
                                  type="market", time_in_force="day")
+                success, message = True, "Order submitted"
 
             else:
-                print(f"{sym}: no action (MA{FAST}={mf:.2f}, MA{SLOW}={ms:.2f}, pos={pos_qty})")
+                signal = "HOLD"
+                action = "None"
+                success = True
+                message = "No trade needed"
+
+            log_entries.append({
+                "timestamp": timestamp,
+                "symbol": sym,
+                "equity": equity,
+                "price": last_price,
+                "ma_fast": mf,
+                "ma_slow": ms,
+                "position": pos_qty,
+                "signal": signal,
+                "action": action,
+                "success": success,
+                "message": message
+            })
 
         except Exception as e:
-            print(f"{sym}: ERROR placing order → {e}")
+            log_entries.append({
+                "timestamp": timestamp,
+                "symbol": sym,
+                "equity": equity,
+                "price": None,
+                "ma_fast": None,
+                "ma_slow": None,
+                "position": None,
+                "signal": None,
+                "action": None,
+                "success": False,
+                "message": f"Exception: {e}"
+            })
+
+    log_data(log_entries)
+
+
 
 if __name__ == "__main__":
     run_daily_check()

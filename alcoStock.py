@@ -66,3 +66,36 @@ if __name__ == '__main__':
     # rerun best for plotting
     final_val = run_backtest(best['fast'], best['slow'], feeds)
     print(f"Final Value (best params): {final_val:,.2f}")
+
+tickers = ['AAPL', 'MSFT', 'TSLA']
+data_feeds = {}
+
+for ticker in tickers:
+    df = yf.download(ticker, start='2018-01-01', end='2024-01-01')
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+    data = bt.feeds.PandasData(dataname=df, name=ticker)
+    data_feeds[ticker] = data
+
+
+cerebro = bt.Cerebro()
+cerebro.addstrategy(MA_Crossover)
+cerebro.broker.set_cash(10000)
+cerebro.addsizer(bt.sizers.PercentSizer, percents=33)
+
+for feed in data_feeds.values():
+    cerebro.adddata(feed)
+
+initial_cash = cerebro.broker.get_cash()
+results = cerebro.run()
+final_value = cerebro.broker.getvalue()
+print(f"Final Portfolio Value: {final_value:.2f}")
+total_return = final_value / initial_cash - 1
+years = 6
+
+apr = (1 + total_return) ** (1 / years) - 1
+print(f"Average APR: {apr * 100:.2f}%")
+cerebro.plot()
