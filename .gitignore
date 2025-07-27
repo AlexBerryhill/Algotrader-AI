@@ -32,3 +32,4 @@
 *.app
 
 .env
+alco_log.parquet
