@@ -33,3 +33,4 @@
 
 .env
 alco_log.parquet
+*.parquet
